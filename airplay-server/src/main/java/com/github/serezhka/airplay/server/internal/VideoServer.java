@@ -1,0 +1,102 @@
+package com.github.serezhka.airplay.server.internal;
+
+import com.github.serezhka.airplay.protocol.FairPlaySession;
+import com.github.serezhka.airplay.server.Playback;
+import com.github.serezhka.airplay.server.internal.decoder.VideoDecoder;
+import com.github.serezhka.airplay.server.internal.handler.video.VideoHandler;
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.socket.ServerSocketChannel;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+import java.net.InetSocketAddress;
+
+@Slf4j
+@RequiredArgsConstructor
+public class VideoServer implements Runnable {
+
+    private volatile java.util.concurrent.CountDownLatch started = new java.util.concurrent.CountDownLatch(1);
+
+    private final FairPlaySession airPlay;
+
+    private Thread thread;
+    private Playback airPlayConsumer;
+
+    @Getter
+    private int port;
+
+    public void start(Playback airPlayConsumer) throws InterruptedException {
+        this.airPlayConsumer = airPlayConsumer;
+        started = new java.util.concurrent.CountDownLatch(1);
+        thread = new Thread(this);
+        thread.start();
+        if (!started.await(15, java.util.concurrent.TimeUnit.SECONDS)) {
+            throw new IllegalStateException("VideoServer did not start in time");
+        }
+    }
+
+    public void stop() {
+        if (thread != null) {
+            thread.interrupt();
+            thread = null;
+            airPlayConsumer = null;
+        }
+    }
+
+    /** True while the accept thread is alive (mirror video path). */
+    public boolean isRunning() {
+        return thread != null && thread.isAlive();
+    }
+
+    @Override
+    public void run() {
+        var serverBootstrap = new ServerBootstrap();
+        var bossGroup = eventLoopGroup();
+        var workerGroup = eventLoopGroup();
+        try {
+            serverBootstrap
+                    .group(bossGroup, workerGroup)
+                    .channel(serverSocketChannelClass())
+                    .localAddress(new InetSocketAddress(0)) // bind random port
+                    .childHandler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        public void initChannel(final SocketChannel ch) {
+                            ch.pipeline().addLast("videoDecoder", new VideoDecoder());
+                            ch.pipeline().addLast("videoHandler", new VideoHandler(airPlay, airPlayConsumer));
+                        }
+                    })
+                    .childOption(ChannelOption.TCP_NODELAY, true)
+                    .childOption(ChannelOption.SO_REUSEADDR, true)
+                    .childOption(ChannelOption.SO_KEEPALIVE, true);
+            var channelFuture = serverBootstrap.bind().sync();
+
+            log.info("AirPlay video server listening on port: {}",
+                    port = ((InetSocketAddress) channelFuture.channel().localAddress()).getPort());
+
+            started.countDown();
+
+            channelFuture.channel().closeFuture().sync();
+        } catch (InterruptedException e) {
+            log.debug("AirPlay video server interrupted");
+        } finally {
+            started.countDown();
+            log.debug("AirPlay video server stopped");
+            bossGroup.shutdownGracefully();
+            workerGroup.shutdownGracefully();
+        }
+    }
+
+    private EventLoopGroup eventLoopGroup() {
+        return NettyEventLoops.create();
+    }
+
+    private Class<? extends ServerSocketChannel> serverSocketChannelClass() {
+        return NioServerSocketChannel.class;
+    }
+}
